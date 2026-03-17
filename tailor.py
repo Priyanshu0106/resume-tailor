@@ -1,12 +1,30 @@
+"""Resume tailoring tool — CLI entry point and web API backend.
+
+CLI usage:
+    python tailor.py --resume resume.docx --jd jd.txt --output tailored.docx
+    python tailor.py --resume resume.docx --jd-url https://example.com/job --dry-run
+
+Web app (app.py) imports tailor_resume() which uses OpenRouter/Gemini.
+CLI mode uses the modular lib/ pipeline with OpenRouter/Gemini.
+"""
+
+import argparse
 import json
 import os
 import re
 import shutil
+import sys
 import zipfile
 from io import BytesIO
+from pathlib import Path
 from xml.etree import ElementTree as ET
 from openai import OpenAI
 
+
+# ===================================================================
+# WEB APP BACKEND (used by app.py via `from tailor import tailor_resume`)
+# Uses OpenRouter + Gemini — kept for Render deployment compatibility
+# ===================================================================
 
 # Word XML namespace
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -47,54 +65,24 @@ def _get_client():
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 
-# ---------------------------------------------------------------------------
-# Content detection: determine what is editable vs locked
-# ---------------------------------------------------------------------------
-
 def _is_modifiable_text(text: str) -> bool:
-    """Identify text safe to reword: bullet points and descriptive lines.
-
-    LOCKED (return False):
-      - Empty lines, very short lines (headers/names)
-      - Contact info (email, phone, URLs, LinkedIn, GitHub)
-      - ALL CAPS lines (section headers)
-      - Date patterns like MM/YYYY, MM/YY (company/date lines)
-      - Education rows (institution | degree | percentage | date)
-      - Certificate/achievement titles
-      - Pipe-separated lines with very short segments (skills line handled separately)
-    """
     text = text.strip()
     if not text:
         return False
-    # Skip very short lines (likely headers/names/titles)
     if len(text.split()) <= 3:
         return False
-    # Skip contact info
     if re.search(r"@|linkedin\.com|github\.com|https?://|\+?\d[\d\s\-\(\)]{7,}", text, re.I):
         return False
-    # Skip ALL CAPS lines (section headers)
     if text.isupper():
         return False
-    # Skip lines that are primarily date patterns (company lines like "Abbott India ... 04/2024 – 06/2024")
     if re.search(r"\d{2}/\d{2,4}\s*[–\-]\s*(\d{2}/\d{2,4}|Present)", text, re.I):
         return False
-    # Skip education-style rows (contain percentage patterns like 79.68%)
     if re.search(r"\d{2,3}\.\d+%", text):
         return False
     return True
 
 
-def _is_skills_line(text: str) -> bool:
-    """Detect pipe-separated skills lines like 'SAP FICO | Excel | PowerPoint | ...'"""
-    return text.count("|") >= 3
-
-
-# ---------------------------------------------------------------------------
-# XML text extraction and replacement (DOCX)
-# ---------------------------------------------------------------------------
-
 def _extract_para_text(para_elem) -> str:
-    """Extract full text from a w:p element by reading all w:t elements."""
     texts = []
     for t in para_elem.iter(f"{{{_W_NS}}}t"):
         if t.text:
@@ -103,9 +91,6 @@ def _extract_para_text(para_elem) -> str:
 
 
 def _set_para_text_xml(para_elem, new_text: str):
-    """Replace text in a w:p element using Option B from CLAUDE.md:
-    Put all new text in the FIRST w:r's w:t, empty remaining w:t elements.
-    This preserves paragraph-level and run-level formatting tags."""
     t_elems = list(para_elem.iter(f"{{{_W_NS}}}t"))
     if not t_elems:
         return
@@ -114,10 +99,6 @@ def _set_para_text_xml(para_elem, new_text: str):
     for t in t_elems[1:]:
         t.text = ""
 
-
-# ---------------------------------------------------------------------------
-# AI tailoring with structured prompt (per CLAUDE.md spec)
-# ---------------------------------------------------------------------------
 
 _TAILOR_SYSTEM_PROMPT = """You are a resume tailoring expert. You will receive:
 1. A list of resume content blocks (bullets, skills, etc.) with their index numbers
@@ -156,7 +137,6 @@ Return ONLY valid JSON, no markdown fences, no explanation."""
 
 
 def tailor_with_ai(paragraphs: dict[int, str], jd: str) -> dict[int, str]:
-    """Send resume paragraphs + JD to AI, get back reworded versions."""
     para_list = "\n".join(
         f'[{idx}] {text}' for idx, text in paragraphs.items()
     )
@@ -177,7 +157,6 @@ RESUME LINES TO TAILOR (format: [index] text):
     )
 
     raw = message.choices[0].message.content.strip()
-    # Strip markdown code fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -185,27 +164,17 @@ RESUME LINES TO TAILOR (format: [index] text):
     return {int(k): v for k, v in data.items()}
 
 
-# ---------------------------------------------------------------------------
-# DOCX tailoring — direct XML/ZIP editing (never use python-docx)
-# ---------------------------------------------------------------------------
-
 def tailor_resume_docx(input_path: str, output_path: str, jd: str):
-    """Tailor a DOCX resume by directly editing XML inside the ZIP.
-    Per CLAUDE.md: ONLY edit word/document.xml, never touch styles/numbering/media."""
-
-    # Step 1: Unpack the .docx ZIP
     with zipfile.ZipFile(input_path, "r") as zin:
         doc_xml = zin.read("word/document.xml")
         all_parts = {name: zin.read(name) for name in zin.namelist()}
 
-    # Register all OOXML namespaces to preserve them in output
     for prefix, uri in _OOXML_NAMESPACES.items():
         ET.register_namespace(prefix, uri)
 
     root = ET.fromstring(doc_xml)
     body = root.find(f"{{{_W_NS}}}body")
 
-    # Step 2: Extract paragraphs and identify modifiable ones
     paragraphs = list(body.iter(f"{{{_W_NS}}}p"))
     modifiable = {}
     for i, para in enumerate(paragraphs):
@@ -217,15 +186,12 @@ def tailor_resume_docx(input_path: str, output_path: str, jd: str):
         shutil.copy(input_path, output_path)
         return
 
-    # Step 3: Get tailored text from AI
     changes = tailor_with_ai(modifiable, jd)
 
-    # Step 4: Apply edits — ONLY modify <w:t> text content
     for idx, new_text in changes.items():
         if idx < len(paragraphs):
             _set_para_text_xml(paragraphs[idx], new_text)
 
-    # Step 5: Repack — write modified XML back into the ZIP
     modified_xml = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
 
     buf = BytesIO()
@@ -240,25 +206,18 @@ def tailor_resume_docx(input_path: str, output_path: str, jd: str):
         f.write(buf.getvalue())
 
 
-# ---------------------------------------------------------------------------
-# PDF tailoring — PyMuPDF in-place text replacement
-# ---------------------------------------------------------------------------
-
 def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
-    """Tailor a PDF resume while preserving the original format.
-    Uses PyMuPDF to do in-place text replacement on the PDF."""
     import fitz
 
     doc = fitz.open(input_path)
 
     try:
-        # Step 1: Extract text blocks with position and font metadata
         blocks_info = []
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             page_dict = page.get_text("dict")
             for block in page_dict["blocks"]:
-                if block["type"] != 0:  # skip image blocks
+                if block["type"] != 0:
                     continue
                 full_text = ""
                 first_span = None
@@ -281,7 +240,6 @@ def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
                     "color": first_span["color"],
                 })
 
-        # Step 2: Identify modifiable blocks
         modifiable = {}
         for i, bi in enumerate(blocks_info):
             if _is_modifiable_text(bi["text"]):
@@ -292,22 +250,17 @@ def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
             shutil.copy(input_path, output_path)
             return
 
-        # Step 3: Get tailored text from AI
         changes = tailor_with_ai(modifiable, jd)
 
-        # Step 4: Replace text in PDF
-        # First pass: add redaction annotations to clear old text
         for idx in changes:
             bi = blocks_info[idx]
             page = doc[bi["page_idx"]]
             rect = fitz.Rect(bi["bbox"])
-            page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
+            page.add_redact_annot(rect, fill=(1, 1, 1))
 
-        # Apply all redactions
         for page in doc:
             page.apply_redactions()
 
-        # Second pass: insert new text at same positions with same font/color
         for idx, new_text in changes.items():
             bi = blocks_info[idx]
             page = doc[bi["page_idx"]]
@@ -315,11 +268,9 @@ def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
             fontsize = bi["fontsize"]
             color_int = bi["color"]
 
-            # Skip tiny/invalid rectangles
             if rect.width < 5 or rect.height < 5:
                 continue
 
-            # Convert color int to RGB tuple
             r = ((color_int >> 16) & 0xFF) / 255.0
             g = ((color_int >> 8) & 0xFF) / 255.0
             b = (color_int & 0xFF) / 255.0
@@ -330,25 +281,137 @@ def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
                 tw.fill_textbox(rect, new_text, fontsize=fontsize, font=font, align=0)
                 tw.write_text(page, color=(r, g, b))
             except ValueError:
-                # If text doesn't fit, try with smaller font
                 try:
                     tw = fitz.TextWriter(page.rect)
                     tw.fill_textbox(rect, new_text, fontsize=fontsize * 0.85, font=font, align=0)
                     tw.write_text(page, color=(r, g, b))
                 except ValueError:
-                    pass  # skip this block if it still doesn't fit
+                    pass
 
         doc.save(output_path)
     finally:
         doc.close()
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def tailor_resume(input_path: str, output_path: str, jd: str):
+    """Web app entry point — called by app.py. Uses OpenRouter/Gemini."""
     if input_path.lower().endswith(".pdf"):
         tailor_resume_pdf(input_path, output_path, jd)
     else:
         tailor_resume_docx(input_path, output_path, jd)
+
+
+# ===================================================================
+# CLI MODE — modular pipeline using lib/ modules + OpenRouter/Gemini
+# ===================================================================
+
+def _cli_tailor(args):
+    """Run the full CLI tailoring pipeline."""
+    from lib.docx_parser import parse_docx
+    from lib.jd_parser import parse_jd
+    from lib.ai_tailor import generate_edits
+    from lib.xml_editor import apply_edits, save_xml
+    from lib.docx_packer import repack_docx, cleanup_temp
+
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        print("Error: OPENROUTER_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    resume_path = args.resume
+    if not os.path.isfile(resume_path):
+        print(f"Error: Resume file not found: {resume_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if not resume_path.lower().endswith(".docx"):
+        print("Error: CLI mode only supports .docx files. Use the web app for PDF.", file=sys.stderr)
+        sys.exit(1)
+
+    # Load JD text
+    jd_text = None
+    jd_url = None
+    if args.jd:
+        jd_path = args.jd
+        if not os.path.isfile(jd_path):
+            print(f"Error: JD file not found: {jd_path}", file=sys.stderr)
+            sys.exit(1)
+        jd_text = Path(jd_path).read_text(encoding="utf-8")
+    elif args.jd_url:
+        jd_url = args.jd_url
+    else:
+        print("Error: Provide --jd (file path) or --jd-url (URL).", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine output path
+    if args.output:
+        output_path = args.output
+    else:
+        stem = Path(resume_path).stem
+        output_path = str(Path(resume_path).parent / f"{stem}_tailored.docx")
+
+    print(f"Parsing resume: {resume_path}")
+    resume = parse_docx(resume_path)
+    print(f"  Found {len(resume.editable_blocks)} editable blocks, {len(resume.all_blocks)} total blocks")
+
+    print("Parsing job description...")
+    signals = parse_jd(jd_text=jd_text, jd_url=jd_url)
+    print(f"  Job: {signals.job_title} at {signals.company}")
+    print(f"  Required skills: {', '.join(signals.required_skills[:5])}{'...' if len(signals.required_skills) > 5 else ''}")
+
+    print("Generating tailored edits...")
+    edits = generate_edits(resume, signals)
+    print(f"  Generated {len(edits)} validated edits")
+
+    if args.dry_run:
+        print("\n--- DRY RUN (no file written) ---\n")
+        print(f"{'Idx':<5} {'Section':<25} {'Change'}")
+        print("-" * 80)
+        for edit in edits:
+            print(f"{edit.block_index:<5} {'':<25}")
+            print(f"  BEFORE: {edit.original_text[:80]}{'...' if len(edit.original_text) > 80 else ''}")
+            print(f"  AFTER:  {edit.new_text[:80]}{'...' if len(edit.new_text) > 80 else ''}")
+            print(f"  REASON: {edit.reason}")
+            print()
+        return
+
+    print("Applying edits to XML...")
+    apply_edits(resume, edits)
+    save_xml(resume)
+
+    print(f"Repacking to: {output_path}")
+    repack_docx(resume.temp_dir, output_path)
+
+    cleanup_temp(resume.temp_dir)
+
+    output_size = os.path.getsize(output_path)
+    input_size = os.path.getsize(resume_path)
+    print(f"Done! Output: {output_path} ({output_size:,} bytes, original was {input_size:,} bytes)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Tailor a .docx resume to a job description using AI.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python tailor.py --resume resume.docx --jd job.txt
+  python tailor.py --resume resume.docx --jd job.txt --output tailored.docx
+  python tailor.py --resume resume.docx --jd-url https://example.com/job --dry-run
+""",
+    )
+    parser.add_argument("--resume", required=True, help="Path to .docx resume file")
+    parser.add_argument("--jd", help="Path to job description text file")
+    parser.add_argument("--jd-url", help="URL to fetch job description from")
+    parser.add_argument("--output", help="Output path (default: <resume>_tailored.docx)")
+    parser.add_argument("--dry-run", action="store_true", help="Show changes without writing file")
+
+    args = parser.parse_args()
+    _cli_tailor(args)
+
+
+if __name__ == "__main__":
+    # If called with CLI args, run CLI mode; otherwise start web server
+    if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
+        main()
+    else:
+        import uvicorn
+        port = int(os.environ.get("PORT", 8000))
+        uvicorn.run("app:app", host="0.0.0.0", port=port)
