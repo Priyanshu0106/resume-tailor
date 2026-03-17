@@ -1,12 +1,11 @@
 import os
 import uuid
-import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from tailor import tailor_resume
 
@@ -40,6 +39,14 @@ async def tailor(
     # Output keeps same format as input (PDF→PDF, DOCX→DOCX)
     output_path = UPLOAD_DIR / f"{session}_tailored{ext}"
 
+    def cleanup():
+        for p in (input_path, output_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+
     try:
         content = await resume.read()
         input_path.write_bytes(content)
@@ -58,17 +65,11 @@ async def tailor(
             path=str(output_path),
             media_type=media_type,
             filename=download_name,
-            background=None,
+            background=BackgroundTask(cleanup),
         )
     except Exception as e:
+        cleanup()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        for p in (input_path, output_path):
-            try:
-                if p.exists():
-                    p.unlink()
-            except OSError:
-                pass
 
 
 if __name__ == "__main__":
