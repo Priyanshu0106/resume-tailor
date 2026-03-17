@@ -2,12 +2,14 @@ import json
 import os
 import re
 from docx import Document
+from docx.shared import Pt
 from openai import OpenAI
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ.get("OPENROUTER_API_KEY"),
-)
+def _get_client():
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
+    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 
 def _para_text(para):
@@ -79,7 +81,7 @@ Return a JSON object mapping each index to its tailored version. Example:
 
 Return ONLY valid JSON, no explanation."""
 
-    message = client.chat.completions.create(
+    message = _get_client().chat.completions.create(
         model="google/gemini-2.0-flash-001",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
@@ -102,7 +104,7 @@ def apply_tailoring(doc: Document, changes: dict[int, str]) -> Document:
     return doc
 
 
-def tailor_resume(input_path: str, output_path: str, jd: str):
+def tailor_resume_docx(input_path: str, output_path: str, jd: str):
     doc = Document(input_path)
     modifiable = extract_modifiable(doc)
     if not modifiable:
@@ -111,3 +113,45 @@ def tailor_resume(input_path: str, output_path: str, jd: str):
     changes = tailor_with_claude(modifiable, jd)
     apply_tailoring(doc, changes)
     doc.save(output_path)
+
+
+def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
+    import pdfplumber
+    lines = []
+    with pdfplumber.open(input_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                lines.append(line)
+
+    # Build index map of modifiable lines (same rules as docx)
+    modifiable = {}
+    for i, line in enumerate(lines):
+        text = line.strip()
+        if not text:
+            continue
+        if len(text.split()) <= 3:
+            continue
+        if re.search(r"[@|•|linkedin|github|http|\+?\d[\d\s\-\(\)]{7,}]", text, re.I):
+            continue
+        if text.isupper():
+            continue
+        modifiable[i] = text
+
+    if modifiable:
+        changes = tailor_with_claude(modifiable, jd)
+        for idx, new_text in changes.items():
+            lines[idx] = new_text
+
+    # Write output as a plain .docx
+    doc = Document()
+    for line in lines:
+        doc.add_paragraph(line)
+    doc.save(output_path)
+
+
+def tailor_resume(input_path: str, output_path: str, jd: str):
+    if input_path.lower().endswith(".pdf"):
+        tailor_resume_pdf(input_path, output_path, jd)
+    else:
+        tailor_resume_docx(input_path, output_path, jd)

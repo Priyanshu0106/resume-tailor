@@ -29,13 +29,14 @@ async def tailor(
     resume: UploadFile = File(...),
     jd: str = Form(...),
 ):
-    if not resume.filename.endswith(".docx"):
-        raise HTTPException(status_code=400, detail="Only .docx files are supported.")
+    if not resume.filename.lower().endswith((".docx", ".pdf")):
+        raise HTTPException(status_code=400, detail="Only .docx and .pdf files are supported.")
     if not jd.strip():
         raise HTTPException(status_code=400, detail="Job description cannot be empty.")
 
+    ext = Path(resume.filename).suffix.lower()
     session = uuid.uuid4().hex
-    input_path = UPLOAD_DIR / f"{session}_input.docx"
+    input_path = UPLOAD_DIR / f"{session}_input{ext}"
     output_path = UPLOAD_DIR / f"{session}_tailored.docx"
 
     try:
