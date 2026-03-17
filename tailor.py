@@ -2,8 +2,15 @@ import json
 import os
 import re
 import shutil
-from docx import Document
+import zipfile
+from io import BytesIO
+from xml.etree import ElementTree as ET
 from openai import OpenAI
+
+
+# Word XML namespace
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+ET.register_namespace("w", _W_NS)
 
 
 def _get_client():
@@ -13,51 +20,44 @@ def _get_client():
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 
-def _para_text(para):
-    return "".join(run.text for run in para.runs)
-
-
-def _set_para_text(para, new_text: str):
-    """Replace paragraph text while preserving all run-level formatting.
-    Puts new text in first run, blanks out the rest."""
-    if not para.runs:
-        return
-    para.runs[0].text = new_text
-    for run in para.runs[1:]:
-        run.text = ""
-
-
 def _is_modifiable_text(text: str) -> bool:
     """Identify text safe to reword: bullet points and descriptive lines.
     Skip: empty lines, short headers, contact info, ALL CAPS headers."""
     text = text.strip()
     if not text:
         return False
-    # Skip very short lines (likely headers/names)
     if len(text.split()) <= 3:
         return False
-    # Skip lines that look like contact info (email, phone, urls)
-    # FIX: use alternation (|) not character class ([])
     if re.search(r"@|linkedin\.com|github\.com|https?://|\+?\d[\d\s\-\(\)]{7,}", text, re.I):
         return False
-    # Skip lines that are ALL CAPS (section headers)
     if text.isupper():
         return False
     return True
 
 
-def extract_modifiable(doc: Document) -> dict[int, str]:
-    """Return {paragraph_index: text} for paragraphs that can be reworded."""
-    result = {}
-    for i, para in enumerate(doc.paragraphs):
-        text = _para_text(para).strip()
-        if _is_modifiable_text(text):
-            result[i] = text
-    return result
+def _extract_para_text(para_elem) -> str:
+    """Extract full text from a w:p element by reading all w:t elements."""
+    texts = []
+    for t in para_elem.iter(f"{{{_W_NS}}}t"):
+        if t.text:
+            texts.append(t.text)
+    return "".join(texts)
 
 
-def tailor_with_claude(paragraphs: dict[int, str], jd: str) -> dict[int, str]:
-    """Send resume paragraphs + JD to Claude, get back reworded versions."""
+def _set_para_text_xml(para_elem, new_text: str):
+    """Replace text in a w:p element. Puts all text in the first w:r/w:t,
+    blanks remaining w:t elements. Preserves all run formatting."""
+    t_elems = list(para_elem.iter(f"{{{_W_NS}}}t"))
+    if not t_elems:
+        return
+    t_elems[0].text = new_text
+    t_elems[0].set(f"{{{_W_NS}}}space", "preserve")
+    for t in t_elems[1:]:
+        t.text = ""
+
+
+def tailor_with_ai(paragraphs: dict[int, str], jd: str) -> dict[int, str]:
+    """Send resume paragraphs + JD to AI, get back reworded versions."""
     para_list = "\n".join(
         f'[{idx}] {text}' for idx, text in paragraphs.items()
     )
@@ -91,7 +91,6 @@ Return ONLY valid JSON, no explanation."""
     )
 
     raw = message.choices[0].message.content.strip()
-    # Strip markdown code fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
@@ -99,23 +98,81 @@ Return ONLY valid JSON, no explanation."""
     return {int(k): v for k, v in data.items()}
 
 
-def apply_tailoring(doc: Document, changes: dict[int, str]) -> Document:
-    """Apply Claude's rewrites back to the document."""
-    for idx, new_text in changes.items():
-        if idx < len(doc.paragraphs):
-            _set_para_text(doc.paragraphs[idx], new_text)
-    return doc
-
-
 def tailor_resume_docx(input_path: str, output_path: str, jd: str):
-    doc = Document(input_path)
-    modifiable = extract_modifiable(doc)
+    """Tailor a DOCX resume by directly editing XML inside the ZIP.
+    This preserves all formatting, styles, and features that python-docx would strip."""
+
+    # Read the docx as a ZIP and parse word/document.xml
+    with zipfile.ZipFile(input_path, "r") as zin:
+        doc_xml = zin.read("word/document.xml")
+        all_parts = {name: zin.read(name) for name in zin.namelist()}
+
+    # Parse the document XML, preserving all namespaces
+    # Register common OOXML namespaces to avoid ns0/ns1 prefixes
+    namespaces = {
+        "wpc": "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas",
+        "cx": "http://schemas.microsoft.com/office/drawing/2014/chartex",
+        "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+        "o": "urn:schemas-microsoft-com:office:office",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
+        "v": "urn:schemas-microsoft-com:vml",
+        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        "w10": "urn:schemas-microsoft-com:office:word",
+        "w": _W_NS,
+        "wne": "http://schemas.microsoft.com/office/word/2006/wordml",
+        "sl": "http://schemas.openxmlformats.org/schemaLibrary/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+        "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "lc": "http://schemas.openxmlformats.org/drawingml/2006/lockedCanvas",
+        "dgm": "http://schemas.openxmlformats.org/drawingml/2006/diagram",
+        "w14": "http://schemas.microsoft.com/office/word/2010/wordml",
+        "w15": "http://schemas.microsoft.com/office/word/2012/wordml",
+        "w16se": "http://schemas.microsoft.com/office/word/2015/wordml/symex",
+        "wpg": "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup",
+        "wpi": "http://schemas.microsoft.com/office/word/2010/wordprocessingInk",
+        "wps": "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+    }
+    for prefix, uri in namespaces.items():
+        ET.register_namespace(prefix, uri)
+
+    root = ET.fromstring(doc_xml)
+    body = root.find(f"{{{_W_NS}}}body")
+
+    # Extract paragraphs and identify modifiable ones
+    paragraphs = list(body.iter(f"{{{_W_NS}}}p"))
+    modifiable = {}
+    for i, para in enumerate(paragraphs):
+        text = _extract_para_text(para).strip()
+        if _is_modifiable_text(text):
+            modifiable[i] = text
+
     if not modifiable:
-        doc.save(output_path)
+        shutil.copy(input_path, output_path)
         return
-    changes = tailor_with_claude(modifiable, jd)
-    apply_tailoring(doc, changes)
-    doc.save(output_path)
+
+    # Get tailored text from AI
+    changes = tailor_with_ai(modifiable, jd)
+
+    # Apply changes directly to XML
+    for idx, new_text in changes.items():
+        if idx < len(paragraphs):
+            _set_para_text_xml(paragraphs[idx], new_text)
+
+    # Write modified XML back into the ZIP
+    modified_xml = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in all_parts.items():
+            if name == "word/document.xml":
+                zout.writestr(name, modified_xml)
+            else:
+                zout.writestr(name, data)
+
+    with open(output_path, "wb") as f:
+        f.write(buf.getvalue())
 
 
 def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
@@ -167,7 +224,7 @@ def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
             return
 
         # Step 3: Get tailored text from AI
-        changes = tailor_with_claude(modifiable, jd)
+        changes = tailor_with_ai(modifiable, jd)
 
         # Step 4: Replace text in PDF
         # First pass: add redaction annotations to clear old text
