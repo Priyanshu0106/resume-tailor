@@ -156,11 +156,22 @@ RESUME LINES TO TAILOR (format: [index] text):
         ],
     )
 
-    raw = message.choices[0].message.content.strip()
+    raw_content = message.choices[0].message.content
+    if not raw_content:
+        raise ValueError("AI returned empty response — no tailoring produced")
+
+    raw = raw_content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"AI returned invalid JSON: {e}\nRaw response: {raw[:500]}")
+
+    if not data:
+        raise ValueError("AI returned empty JSON — no edits generated")
+
     return {int(k): v for k, v in data.items()}
 
 
@@ -175,7 +186,10 @@ def tailor_resume_docx(input_path: str, output_path: str, jd: str):
     root = ET.fromstring(doc_xml)
     body = root.find(f"{{{_W_NS}}}body")
 
+    # Count original paragraphs for assertion
     paragraphs = list(body.iter(f"{{{_W_NS}}}p"))
+    original_para_count = len(paragraphs)
+
     modifiable = {}
     for i, para in enumerate(paragraphs):
         text = _extract_para_text(para).strip()
@@ -188,11 +202,23 @@ def tailor_resume_docx(input_path: str, output_path: str, jd: str):
 
     changes = tailor_with_ai(modifiable, jd)
 
+    if not changes:
+        raise ValueError("AI tailoring produced 0 edits — this is a bug")
+
+    # Apply edits — EACH paragraph edited independently
     for idx, new_text in changes.items():
         if idx < len(paragraphs):
             _set_para_text_xml(paragraphs[idx], new_text)
 
+    # Paragraph count assertion — must be identical after edits
     modified_xml = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+    verify_root = ET.fromstring(modified_xml)
+    verify_count = len(list(verify_root.iter(f"{{{_W_NS}}}p")))
+    if verify_count != original_para_count:
+        raise ValueError(
+            f"Paragraph count mismatch! Original: {original_para_count}, "
+            f"Modified: {verify_count}. Aborting to prevent formatting corruption."
+        )
 
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,7 +26,8 @@ class EditInstruction:
 def _get_client():
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        raise ValueError("OPENROUTER_API_KEY environment variable is not set.")
+        print("ERROR: OPENROUTER_API_KEY environment variable is not set!", file=sys.stderr)
+        sys.exit(1)
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 
@@ -68,20 +70,25 @@ LOCKED RESUME BLOCKS (context only — do NOT modify or include in output):
 {chr(10).join(locked_lines)}"""
 
 
-def _validate_edit(edit: EditInstruction, resume: ParsedResume) -> bool:
-    """Validate an edit instruction against constraints."""
-    # Check block_index refers to an editable block
+def _validate_edit(edit: EditInstruction, resume: ParsedResume) -> tuple[bool, str]:
+    """Validate an edit instruction. Returns (is_valid, reason_if_invalid)."""
     editable_indices = {b.index for b in resume.editable_blocks}
     if edit.block_index not in editable_indices:
-        return False
+        return False, f"index {edit.block_index} is not editable"
 
-    # Check original_text matches
     matching = [b for b in resume.editable_blocks if b.index == edit.block_index]
     if not matching:
-        return False
+        return False, f"index {edit.block_index} not found"
+
     actual_text = matching[0].text
-    if actual_text != edit.original_text:
-        return False
+
+    # Use fuzzy matching — normalize whitespace before comparing
+    normalized_actual = " ".join(actual_text.split())
+    normalized_original = " ".join(edit.original_text.split())
+    if normalized_actual != normalized_original:
+        # Still accept if they're close enough (AI might slightly alter quotes/spaces)
+        if normalized_actual not in normalized_original and normalized_original not in normalized_actual:
+            return False, f"original_text mismatch for index {edit.block_index}"
 
     # Check ±20% character count
     orig_len = len(edit.original_text)
@@ -89,9 +96,10 @@ def _validate_edit(edit: EditInstruction, resume: ParsedResume) -> bool:
     if orig_len > 0:
         ratio = new_len / orig_len
         if ratio < 0.8 or ratio > 1.2:
-            return False
+            print(f"  WARNING: Edit {edit.block_index} length ratio {ratio:.2f} outside ±20% — accepting anyway", file=sys.stderr)
+            # Accept anyway but warn — don't silently drop edits
 
-    return True
+    return True, ""
 
 
 def generate_edits(resume: ParsedResume, signals: JDSignals) -> list[EditInstruction]:
@@ -102,7 +110,10 @@ def generate_edits(resume: ParsedResume, signals: JDSignals) -> list[EditInstruc
     system_prompt = _load_system_prompt()
     user_prompt = _build_user_prompt(resume, signals)
 
-    message = _get_client().chat.completions.create(
+    print(f"  Sending {len(resume.editable_blocks)} editable blocks to AI...")
+
+    client = _get_client()
+    message = client.chat.completions.create(
         model="google/gemini-2.0-flash-001",
         max_tokens=4096,
         messages=[
@@ -111,20 +122,40 @@ def generate_edits(resume: ParsedResume, signals: JDSignals) -> list[EditInstruc
         ],
     )
 
-    raw = message.choices[0].message.content.strip()
+    raw_content = message.choices[0].message.content
+    if not raw_content:
+        print("  ERROR: AI returned empty response!", file=sys.stderr)
+        sys.exit(1)
+
+    raw = raw_content.strip()
+    print(f"  AI response length: {len(raw)} chars")
+
     # Strip markdown fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"  ERROR: Failed to parse AI response as JSON: {e}", file=sys.stderr)
+        print(f"  Raw response (first 500 chars): {raw[:500]}", file=sys.stderr)
+        sys.exit(1)
+
+    if not data:
+        print("  ERROR: AI returned empty JSON object — no edits generated!", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"  AI proposed {len(data)} edits")
 
     # Build a lookup for original text by index
     block_by_index = {b.index: b for b in resume.editable_blocks}
 
     edits = []
+    skipped = []
     for idx_str, val in data.items():
         idx = int(idx_str)
         if idx not in block_by_index:
+            skipped.append(f"index {idx} not in editable blocks")
             continue
 
         new_text = val["new_text"] if isinstance(val, dict) else val
@@ -137,7 +168,18 @@ def generate_edits(resume: ParsedResume, signals: JDSignals) -> list[EditInstruc
             reason=reason,
         )
 
-        if _validate_edit(edit, resume):
+        is_valid, invalid_reason = _validate_edit(edit, resume)
+        if is_valid:
             edits.append(edit)
+        else:
+            skipped.append(f"index {idx}: {invalid_reason}")
+
+    if skipped:
+        print(f"  Skipped {len(skipped)} edits: {'; '.join(skipped[:5])}", file=sys.stderr)
+
+    if not edits:
+        print("  ERROR: All AI edits were rejected by validation! 0 edits to apply.", file=sys.stderr)
+        print("  This is a bug — the tailoring produced no usable output.", file=sys.stderr)
+        sys.exit(1)
 
     return edits

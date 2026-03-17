@@ -20,13 +20,17 @@ INPUT: resume.docx/.pdf + job_description
 OUTPUT: tailored_resume.docx (identical formatting, tailored content)
 ```
 
-## XML Editing Rules
+## XML Editing Rules — CRITICAL
 - ONLY edit `word/document.xml` — never touch styles.xml, numbering.xml, media/, _rels/, [Content_Types].xml
-- Only modify `<w:t>` text content within `<w:r>` runs
-- NEVER delete `<w:r>`, `<w:rPr>`, or `<w:pPr>` elements
+- Only modify the `.text` property of `<w:t>` nodes
+- NEVER delete `<w:r>`, `<w:rPr>`, `<w:pPr>`, or `<w:numPr>` elements
 - NEVER add new `<w:r>` elements
-- For multi-run paragraphs: put all new text in first `<w:r>`'s `<w:t>`, empty remaining `<w:t>` elements
+- Every `<w:p>` in the input MUST exist as its own `<w:p>` in the output — paragraph count must be identical
+- NEVER concatenate text from multiple paragraphs into one
+- Each `<w:p>` paragraph MUST be edited independently
+- For multi-run paragraphs: put new text in FIRST `<w:t>` of THAT paragraph only, empty remaining `<w:t>` elements ONLY within that same `<w:p>`
 - Preserve `xml:space="preserve"` attributes
+- Before repacking, count `<w:p>` elements in modified XML vs original — if they differ, abort
 
 ## AI Tailoring Rules
 - Each new_text must be approximately same length as original (±15%)
@@ -59,9 +63,18 @@ For PDF resumes, use PyMuPDF (fitz) for in-place text replacement:
 3. Get AI-tailored text
 4. Redact old text (white fill), insert new text at same position with same font/color
 
+## Error Handling — MUST BE LOUD
+- AI tailoring MUST actually run and produce edits. If it produces 0 edits, that's a bug — log and exit
+- No silent `try/except pass`. If something fails, print what failed and exit
+- If API key not found: bail loudly with clear error message
+- If API returns non-JSON: strip markdown fences before parsing, print raw response if still fails
+- If JSON parse fails: print the raw response and exit, don't silently continue
+- If all edits rejected by validation: print why each was rejected, don't produce unchanged resume
+
 ## Tech Stack
 - FastAPI web framework
 - OpenRouter API (via OpenAI SDK) using google/gemini-2.0-flash-001
-- Direct XML editing via xml.etree.ElementTree for .docx
+- Direct XML editing via xml.etree.ElementTree for .docx (web app)
+- lxml.etree for .docx (CLI lib/ modules)
 - PyMuPDF (fitz) for PDF editing
 - Deployed on Render (https://resume-tailor-oz4o.onrender.com)
