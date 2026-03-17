@@ -3,9 +3,8 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
-from starlette.background import BackgroundTask
 
 from tailor import tailor_resume
 
@@ -39,19 +38,14 @@ async def tailor(
     # Output keeps same format as input (PDF→PDF, DOCX→DOCX)
     output_path = UPLOAD_DIR / f"{session}_tailored{ext}"
 
-    def cleanup():
-        for p in (input_path, output_path):
-            try:
-                if p.exists():
-                    p.unlink()
-            except OSError:
-                pass
-
     try:
         content = await resume.read()
         input_path.write_bytes(content)
 
         tailor_resume(str(input_path), str(output_path), jd)
+
+        # Read output into memory so file access is not an issue
+        output_bytes = output_path.read_bytes()
 
         original_name = Path(resume.filename).stem
         download_name = f"{original_name}_tailored{ext}"
@@ -61,15 +55,20 @@ async def tailor(
         else:
             media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-        return FileResponse(
-            path=str(output_path),
+        return Response(
+            content=output_bytes,
             media_type=media_type,
-            filename=download_name,
-            background=BackgroundTask(cleanup),
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
         )
     except Exception as e:
-        cleanup()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        for p in (input_path, output_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
