@@ -190,12 +190,12 @@
 
     <form id="tailorForm">
       <div class="field">
-        <label>Your Resume (.docx)</label>
+        <label>Your Resume (.docx or .pdf)</label>
         <div class="upload-area" id="uploadArea">
-          <input type="file" id="resumeFile" name="resume" accept=".docx" required />
+          <input type="file" id="resumeFile" name="resume" accept=".docx,.pdf" required />
           <div class="upload-icon">📄</div>
           <div class="upload-text"><strong>Click to upload</strong> or drag & drop</div>
-          <div class="upload-text">.docx files only</div>
+          <div class="upload-text">.docx and .pdf files supported</div>
         </div>
         <div class="file-name" id="fileName"></div>
       </div>
@@ -256,8 +256,14 @@
       try {
         const res = await fetch('/tailor', { method: 'POST', body: formData });
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || 'Something went wrong.');
+          let msg = 'Something went wrong.';
+          try {
+            const err = await res.json();
+            msg = err.detail || msg;
+          } catch (_) {
+            msg = await res.text() || msg;
+          }
+          throw new Error(msg);
         }
         const blob = await res.blob();
         const disposition = res.headers.get('content-disposition') || '';

@@ -1,12 +1,11 @@
 import os
 import uuid
-import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from tailor import tailor_resume
 
@@ -29,14 +28,24 @@ async def tailor(
     resume: UploadFile = File(...),
     jd: str = Form(...),
 ):
-    if not resume.filename.endswith(".docx"):
-        raise HTTPException(status_code=400, detail="Only .docx files are supported.")
+    if not resume.filename.lower().endswith((".docx", ".pdf")):
+        raise HTTPException(status_code=400, detail="Only .docx and .pdf files are supported.")
     if not jd.strip():
         raise HTTPException(status_code=400, detail="Job description cannot be empty.")
 
+    ext = Path(resume.filename).suffix.lower()
     session = uuid.uuid4().hex
-    input_path = UPLOAD_DIR / f"{session}_input.docx"
-    output_path = UPLOAD_DIR / f"{session}_tailored.docx"
+    input_path = UPLOAD_DIR / f"{session}_input{ext}"
+    # Output keeps same format as input (PDF→PDF, DOCX→DOCX)
+    output_path = UPLOAD_DIR / f"{session}_tailored{ext}"
+
+    def cleanup():
+        for p in (input_path, output_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
 
     try:
         content = await resume.read()
@@ -45,19 +54,22 @@ async def tailor(
         tailor_resume(str(input_path), str(output_path), jd)
 
         original_name = Path(resume.filename).stem
-        download_name = f"{original_name}_tailored.docx"
+        download_name = f"{original_name}_tailored{ext}"
+
+        if ext == ".pdf":
+            media_type = "application/pdf"
+        else:
+            media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
         return FileResponse(
             path=str(output_path),
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            media_type=media_type,
             filename=download_name,
-            background=None,
+            background=BackgroundTask(cleanup),
         )
     except Exception as e:
+        cleanup()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if input_path.exists():
-            input_path.unlink()
 
 
 if __name__ == "__main__":
