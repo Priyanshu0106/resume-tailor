@@ -125,81 +125,96 @@ def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
 
     doc = fitz.open(input_path)
 
-    # Step 1: Extract text blocks with position and font metadata
-    blocks_info = []
-    for page_idx in range(len(doc)):
-        page = doc[page_idx]
-        page_dict = page.get_text("dict")
-        for block in page_dict["blocks"]:
-            if block["type"] != 0:  # skip image blocks
+    try:
+        # Step 1: Extract text blocks with position and font metadata
+        blocks_info = []
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            page_dict = page.get_text("dict")
+            for block in page_dict["blocks"]:
+                if block["type"] != 0:  # skip image blocks
+                    continue
+                full_text = ""
+                first_span = None
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        if first_span is None:
+                            first_span = span
+                        full_text += span["text"]
+                    full_text += " "
+                full_text = full_text.strip()
+
+                if not full_text or first_span is None:
+                    continue
+
+                blocks_info.append({
+                    "page_idx": page_idx,
+                    "text": full_text,
+                    "bbox": block["bbox"],
+                    "fontsize": first_span["size"],
+                    "color": first_span["color"],
+                })
+
+        # Step 2: Identify modifiable blocks
+        modifiable = {}
+        for i, bi in enumerate(blocks_info):
+            if _is_modifiable_text(bi["text"]):
+                modifiable[i] = bi["text"]
+
+        if not modifiable:
+            doc.close()
+            shutil.copy(input_path, output_path)
+            return
+
+        # Step 3: Get tailored text from AI
+        changes = tailor_with_claude(modifiable, jd)
+
+        # Step 4: Replace text in PDF
+        # First pass: add redaction annotations to clear old text
+        for idx in changes:
+            bi = blocks_info[idx]
+            page = doc[bi["page_idx"]]
+            rect = fitz.Rect(bi["bbox"])
+            page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
+
+        # Apply all redactions
+        for page in doc:
+            page.apply_redactions()
+
+        # Second pass: insert new text at same positions
+        for idx, new_text in changes.items():
+            bi = blocks_info[idx]
+            page = doc[bi["page_idx"]]
+            rect = fitz.Rect(bi["bbox"])
+            fontsize = bi["fontsize"]
+            color_int = bi["color"]
+
+            # Skip tiny/invalid rectangles
+            if rect.width < 5 or rect.height < 5:
                 continue
-            full_text = ""
-            first_span = None
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    if first_span is None:
-                        first_span = span
-                    full_text += span["text"]
-                full_text += " "
-            full_text = full_text.strip()
 
-            if not full_text or first_span is None:
-                continue
+            # Convert color int to RGB tuple
+            r = ((color_int >> 16) & 0xFF) / 255.0
+            g = ((color_int >> 8) & 0xFF) / 255.0
+            b = (color_int & 0xFF) / 255.0
 
-            blocks_info.append({
-                "page_idx": page_idx,
-                "text": full_text,
-                "bbox": block["bbox"],
-                "fontsize": first_span["size"],
-                "color": first_span["color"],
-            })
+            try:
+                tw = fitz.TextWriter(page.rect)
+                font = fitz.Font("helv")
+                tw.fill_textbox(rect, new_text, fontsize=fontsize, font=font, align=0)
+                tw.write_text(page, color=(r, g, b))
+            except ValueError:
+                # If text doesn't fit in the rectangle, try with smaller font
+                try:
+                    tw = fitz.TextWriter(page.rect)
+                    tw.fill_textbox(rect, new_text, fontsize=fontsize * 0.85, font=font, align=0)
+                    tw.write_text(page, color=(r, g, b))
+                except ValueError:
+                    pass  # skip this block if it still doesn't fit
 
-    # Step 2: Identify modifiable blocks
-    modifiable = {}
-    for i, bi in enumerate(blocks_info):
-        if _is_modifiable_text(bi["text"]):
-            modifiable[i] = bi["text"]
-
-    if not modifiable:
-        shutil.copy(input_path, output_path)
+        doc.save(output_path)
+    finally:
         doc.close()
-        return
-
-    # Step 3: Get tailored text from AI
-    changes = tailor_with_claude(modifiable, jd)
-
-    # Step 4: Replace text in PDF
-    # First pass: add redaction annotations to clear old text
-    for idx in changes:
-        bi = blocks_info[idx]
-        page = doc[bi["page_idx"]]
-        rect = fitz.Rect(bi["bbox"])
-        page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
-
-    # Apply all redactions
-    for page in doc:
-        page.apply_redactions()
-
-    # Second pass: insert new text at same positions
-    for idx, new_text in changes.items():
-        bi = blocks_info[idx]
-        page = doc[bi["page_idx"]]
-        rect = fitz.Rect(bi["bbox"])
-        fontsize = bi["fontsize"]
-        color_int = bi["color"]
-
-        # Convert color int to RGB tuple
-        r = ((color_int >> 16) & 0xFF) / 255.0
-        g = ((color_int >> 8) & 0xFF) / 255.0
-        b = (color_int & 0xFF) / 255.0
-
-        tw = fitz.TextWriter(page.rect)
-        font = fitz.Font("helv")
-        tw.fill_textbox(rect, new_text, fontsize=fontsize, font=font, align=0)
-        tw.write_text(page, color=(r, g, b))
-
-    doc.save(output_path)
-    doc.close()
 
 
 def tailor_resume(input_path: str, output_path: str, jd: str):

@@ -63,8 +63,12 @@ async def tailor(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if input_path.exists():
-            input_path.unlink()
+        for p in (input_path, output_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
