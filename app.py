@@ -37,7 +37,8 @@ async def tailor(
     ext = Path(resume.filename).suffix.lower()
     session = uuid.uuid4().hex
     input_path = UPLOAD_DIR / f"{session}_input{ext}"
-    output_path = UPLOAD_DIR / f"{session}_tailored.docx"
+    # Output keeps same format as input (PDF→PDF, DOCX→DOCX)
+    output_path = UPLOAD_DIR / f"{session}_tailored{ext}"
 
     try:
         content = await resume.read()
@@ -46,11 +47,16 @@ async def tailor(
         tailor_resume(str(input_path), str(output_path), jd)
 
         original_name = Path(resume.filename).stem
-        download_name = f"{original_name}_tailored.docx"
+        download_name = f"{original_name}_tailored{ext}"
+
+        if ext == ".pdf":
+            media_type = "application/pdf"
+        else:
+            media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
         return FileResponse(
             path=str(output_path),
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            media_type=media_type,
             filename=download_name,
             background=None,
         )

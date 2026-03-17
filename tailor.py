@@ -1,9 +1,10 @@
 import json
 import os
 import re
+import shutil
 from docx import Document
-from docx.shared import Pt
 from openai import OpenAI
+
 
 def _get_client():
     api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -26,17 +27,18 @@ def _set_para_text(para, new_text: str):
         run.text = ""
 
 
-def _is_modifiable(para) -> bool:
-    """Identify paragraphs safe to reword: bullet points and short descriptive lines.
-    Skip: empty lines, single words (section headers), contact info lines."""
-    text = _para_text(para).strip()
+def _is_modifiable_text(text: str) -> bool:
+    """Identify text safe to reword: bullet points and descriptive lines.
+    Skip: empty lines, short headers, contact info, ALL CAPS headers."""
+    text = text.strip()
     if not text:
         return False
     # Skip very short lines (likely headers/names)
     if len(text.split()) <= 3:
         return False
     # Skip lines that look like contact info (email, phone, urls)
-    if re.search(r"[@|•|linkedin|github|http|\+?\d[\d\s\-\(\)]{7,}]", text, re.I):
+    # FIX: use alternation (|) not character class ([])
+    if re.search(r"@|linkedin\.com|github\.com|https?://|\+?\d[\d\s\-\(\)]{7,}", text, re.I):
         return False
     # Skip lines that are ALL CAPS (section headers)
     if text.isupper():
@@ -48,8 +50,9 @@ def extract_modifiable(doc: Document) -> dict[int, str]:
     """Return {paragraph_index: text} for paragraphs that can be reworded."""
     result = {}
     for i, para in enumerate(doc.paragraphs):
-        if _is_modifiable(para):
-            result[i] = _para_text(para).strip()
+        text = _para_text(para).strip()
+        if _is_modifiable_text(text):
+            result[i] = text
     return result
 
 
@@ -116,38 +119,87 @@ def tailor_resume_docx(input_path: str, output_path: str, jd: str):
 
 
 def tailor_resume_pdf(input_path: str, output_path: str, jd: str):
-    import pdfplumber
-    lines = []
-    with pdfplumber.open(input_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            for line in text.splitlines():
-                lines.append(line)
+    """Tailor a PDF resume while preserving the original format.
+    Uses PyMuPDF to do in-place text replacement on the PDF."""
+    import fitz
 
-    # Build index map of modifiable lines (same rules as docx)
+    doc = fitz.open(input_path)
+
+    # Step 1: Extract text blocks with position and font metadata
+    blocks_info = []
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        page_dict = page.get_text("dict")
+        for block in page_dict["blocks"]:
+            if block["type"] != 0:  # skip image blocks
+                continue
+            full_text = ""
+            first_span = None
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    if first_span is None:
+                        first_span = span
+                    full_text += span["text"]
+                full_text += " "
+            full_text = full_text.strip()
+
+            if not full_text or first_span is None:
+                continue
+
+            blocks_info.append({
+                "page_idx": page_idx,
+                "text": full_text,
+                "bbox": block["bbox"],
+                "fontsize": first_span["size"],
+                "color": first_span["color"],
+            })
+
+    # Step 2: Identify modifiable blocks
     modifiable = {}
-    for i, line in enumerate(lines):
-        text = line.strip()
-        if not text:
-            continue
-        if len(text.split()) <= 3:
-            continue
-        if re.search(r"[@|•|linkedin|github|http|\+?\d[\d\s\-\(\)]{7,}]", text, re.I):
-            continue
-        if text.isupper():
-            continue
-        modifiable[i] = text
+    for i, bi in enumerate(blocks_info):
+        if _is_modifiable_text(bi["text"]):
+            modifiable[i] = bi["text"]
 
-    if modifiable:
-        changes = tailor_with_claude(modifiable, jd)
-        for idx, new_text in changes.items():
-            lines[idx] = new_text
+    if not modifiable:
+        shutil.copy(input_path, output_path)
+        doc.close()
+        return
 
-    # Write output as a plain .docx
-    doc = Document()
-    for line in lines:
-        doc.add_paragraph(line)
+    # Step 3: Get tailored text from AI
+    changes = tailor_with_claude(modifiable, jd)
+
+    # Step 4: Replace text in PDF
+    # First pass: add redaction annotations to clear old text
+    for idx in changes:
+        bi = blocks_info[idx]
+        page = doc[bi["page_idx"]]
+        rect = fitz.Rect(bi["bbox"])
+        page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
+
+    # Apply all redactions
+    for page in doc:
+        page.apply_redactions()
+
+    # Second pass: insert new text at same positions
+    for idx, new_text in changes.items():
+        bi = blocks_info[idx]
+        page = doc[bi["page_idx"]]
+        rect = fitz.Rect(bi["bbox"])
+        fontsize = bi["fontsize"]
+        color_int = bi["color"]
+
+        # Convert color int to RGB tuple
+        r = ((color_int >> 16) & 0xFF) / 255.0
+        g = ((color_int >> 8) & 0xFF) / 255.0
+        b = (color_int & 0xFF) / 255.0
+
+        tw = fitz.TextWriter(page.rect)
+        font = fitz.Font("helv")
+        tw.fill_textbox(rect, new_text, fontsize=fontsize, font=font, align=0)
+        tw.write_text(page, color=(r, g, b))
+
     doc.save(output_path)
+    doc.close()
 
 
 def tailor_resume(input_path: str, output_path: str, jd: str):
